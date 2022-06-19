@@ -3,6 +3,7 @@
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/tcp.h>
+#include <linux/workqueue.h>
 
 #include "http_parser.h"
 #include "http_server.h"
@@ -38,6 +39,9 @@ struct http_request {
     char request_url[128];
     int complete;
 };
+
+struct http_service daemon = {.is_stopped = false};
+struct workqueue_struct *khttp_wq;
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
@@ -187,11 +191,50 @@ static int http_server_worker(void *arg)
     return 0;
 }
 
+static void khttp_worker(struct work_struct *work)
+{
+    struct khttpd *worker = container_of(work, struct khttpd, khttpd_work);
+    http_server_worker(worker->sock);
+}
+
+static struct work_struct *create_work(struct socket *sk)
+{
+    struct khttpd *work;
+
+    if (!(work = kmalloc(sizeof(struct khttpd), GFP_KERNEL)))
+        return NULL;
+
+    work->sock = sk;
+
+    INIT_WORK(&work->khttpd_work, khttp_worker);
+
+    list_add(&work->list, &daemon.worker);
+
+    return &work->khttpd_work;
+}
+
+static void free_work(void)
+{
+    struct khttpd *l, *tar;
+
+    list_for_each_entry_safe (tar, l, &daemon.worker, list) {
+        kernel_sock_shutdown(tar->sock, SHUT_RDWR);
+        flush_work(&tar->khttpd_work);
+        sock_release(tar->sock);
+        kfree(tar);
+    }
+}
+
+
+
 int http_server_daemon(void *arg)
 {
     struct socket *socket;
-    struct task_struct *worker;
+    struct work_struct *work;
     struct http_server_param *param = (struct http_server_param *) arg;
+    khttp_wq = alloc_workqueue("KBUILD_MODNAME", WQ_UNBOUND, 0);
+
+    INIT_LIST_HEAD(&daemon.worker);
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
@@ -204,11 +247,19 @@ int http_server_daemon(void *arg)
             pr_err("kernel_accept() error: %d\n", err);
             continue;
         }
-        worker = kthread_run(http_server_worker, socket, KBUILD_MODNAME);
-        if (IS_ERR(worker)) {
-            pr_err("can't create more worker process\n");
+
+        // modify the original kthread-based to CMWQ
+        work = create_work(socket);
+        if (!work) {
+            pr_err("can't create more work\n");
             continue;
         }
+        queue_work(khttp_wq, work);
     }
+
+    daemon.is_stopped = true;
+    free_work();
+    destroy_workqueue(khttp_wq);
+
     return 0;
 }
